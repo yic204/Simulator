@@ -1,0 +1,6 @@
+{
+  "name": "Titration Simulator",
+  "description": "A high-precision, scientifically accurate laboratory acid-base titration simulator for university students, featuring real chemical mathematics, multiple titration models, and real-time interactive analytical tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
