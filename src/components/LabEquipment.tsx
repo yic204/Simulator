@@ -100,6 +100,101 @@ export const LabEquipment: React.FC<LabEquipmentProps> = React.memo(({
   const dropVolumeRef = useRef(dropVolume);
   const interpolatedVolumeRef = useRef(volumeAdded);
 
+  // --- ADAPTIVE PERFORMANCE ENGINE ---
+  const [quality, setQuality] = useState<"low" | "medium" | "high" | "ultra">("ultra");
+  const [isAutoQuality, setIsAutoQuality] = useState(true);
+  const [fps, setFps] = useState(120);
+
+  const qualityRef = useRef<"low" | "medium" | "high" | "ultra">("ultra");
+  const isAutoQualityRef = useRef(true);
+  const consecutiveLowFpsRef = useRef(0);
+  const frameCountRef = useRef(0);
+  const fpsStartTimeRef = useRef(0);
+  const isComponentVisibleRef = useRef(true);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Monitor visibility using IntersectionObserver
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    if (typeof IntersectionObserver === "undefined") {
+      isComponentVisibleRef.current = true;
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          isComponentVisibleRef.current = entry.isIntersecting;
+        });
+      },
+      { threshold: 0.05 }
+    );
+
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  // Sync automatic spec detection on mount
+  useEffect(() => {
+    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    const cores = navigator.hardwareConcurrency || 4;
+    const memory = (navigator as any).deviceMemory || 4;
+
+    let initialQuality: "low" | "medium" | "high" | "ultra" = "ultra";
+
+    if (isMobile) {
+      if (cores >= 8 && memory >= 6) {
+        initialQuality = "high";
+      } else if (cores >= 4 && memory >= 4) {
+        initialQuality = "medium";
+      } else {
+        initialQuality = "low";
+      }
+    } else {
+      if (cores >= 8) {
+        initialQuality = "ultra";
+      } else if (cores >= 4) {
+        initialQuality = "high";
+      } else {
+        initialQuality = "medium";
+      }
+    }
+
+    setQuality(initialQuality);
+    qualityRef.current = initialQuality;
+  }, []);
+
+  // Battery monitoring for power saving
+  useEffect(() => {
+    let batteryInstance: any = null;
+    const handleBatteryChange = () => {
+      if (batteryInstance && batteryInstance.level < 0.20 && !batteryInstance.charging) {
+        setQuality("low");
+        qualityRef.current = "low";
+        setIsAutoQuality(false);
+        isAutoQualityRef.current = false;
+      }
+    };
+
+    if (navigator.getBattery) {
+      navigator.getBattery().then((battery) => {
+        batteryInstance = battery;
+        battery.addEventListener("levelchange", handleBatteryChange);
+        battery.addEventListener("chargingchange", handleBatteryChange);
+        handleBatteryChange();
+      });
+    }
+
+    return () => {
+      if (batteryInstance) {
+        batteryInstance.removeEventListener("levelchange", handleBatteryChange);
+        batteryInstance.removeEventListener("chargingchange", handleBatteryChange);
+      }
+    };
+  }, []);
+
   useEffect(() => {
     volumeRef.current = volumeAdded;
   }, [volumeAdded]);
@@ -275,8 +370,44 @@ export const LabEquipment: React.FC<LabEquipmentProps> = React.memo(({
     let lastTime = performance.now();
 
     const tick = (time: number) => {
+      // 1. Visibility & Background check (saves battery/CPU cycles when backgrounded or scrolled off-screen)
+      if (document.hidden || !isComponentVisibleRef.current) {
+        animId = window.setTimeout(() => {
+          animId = requestAnimationFrame(tick);
+        }, 200) as any;
+        return;
+      }
+
       const delta = Math.min(0.05, (time - lastTime) / 1000); // limit delta to prevent large jumps on tab switch
       lastTime = time;
+
+      // Track FPS & Auto Quality adjustment
+      frameCountRef.current += 1;
+      const elapsedMs = time - fpsStartTimeRef.current;
+      if (elapsedMs >= 1000) {
+        const calculatedFps = (frameCountRef.current * 1000) / elapsedMs;
+        frameCountRef.current = 0;
+        fpsStartTimeRef.current = time;
+        setFps(calculatedFps);
+
+        if (isAutoQualityRef.current) {
+          if (calculatedFps < 42) {
+            const currentQ = qualityRef.current;
+            let nextQ: "low" | "medium" | "high" | "ultra" = currentQ;
+            if (currentQ === "ultra") nextQ = "high";
+            else if (currentQ === "high") nextQ = "medium";
+            else if (currentQ === "medium") nextQ = "low";
+            
+            if (nextQ !== currentQ) {
+              setQuality(nextQ);
+              qualityRef.current = nextQ;
+            }
+            consecutiveLowFpsRef.current = 0;
+          } else {
+            consecutiveLowFpsRef.current = 0;
+          }
+        }
+      }
 
       // 1. Spring-based interpolation for flask volume level (physical spring-mass-damper)
       const targetVolume = volumeRef.current;
@@ -308,7 +439,9 @@ export const LabEquipment: React.FC<LabEquipmentProps> = React.memo(({
       wavePhaseRef.current = (wavePhaseRef.current + delta * 8) % (Math.PI * 2);
       const speed = stirrerSpeedRef.current;
       const currentVortexDepth = speed > 0 ? 1.5 + (speed / 100) * 4.5 : 1.5;
-      const waveOffset = (speed > 0 ? 0.8 : 0.2) * Math.sin(wavePhaseRef.current) * 1.0;
+      
+      const isLow = qualityRef.current === "low";
+      const waveOffset = (!isLow && speed > 0 ? 0.8 : 0.2) * Math.sin(wavePhaseRef.current) * 1.0;
 
       // 4. Spring-based surface oscillation update (subtle inertia-based oscillation)
       const OSC_STIFFNESS = 160.0;
@@ -331,22 +464,33 @@ export const LabEquipment: React.FC<LabEquipmentProps> = React.memo(({
       }
       const currentOsc = surfaceOscillationRef.current;
 
-      // 5. Directly update the liquid mask and top surface paths
-      if (liquidMaskPathRef.current) {
-        const maskD = `
-          M ${currentLeftX} ${currentTopY + currentOsc}
-          Q 150 ${currentTopY + currentVortexDepth + waveOffset + currentOsc} ${currentRightX} ${currentTopY + currentOsc}
-          L 210 350
-          L 90 350
-          Z
-        `;
-        liquidMaskPathRef.current.setAttribute("d", maskD);
-      }
+      // --- PATH THROTTLING / NO REDUNDANT UPDATES ENGINE ---
+      const needsLevelUpdate = Math.abs(volumeVelocityRef.current) > 0.005 || Math.abs(volDiff) > 0.005;
+      const needsOscillationUpdate = Math.abs(surfaceOscVelocityRef.current) > 0.01 || Math.abs(surfaceOscillationRef.current) > 0.01;
+      const needsWaveUpdate = speed > 0 && !isLow;
+      const hasActiveDrop = currentDropVolumeRef.current !== null;
+      const hasActiveRipple = rippleAgeRef.current !== null;
 
-      const surfaceD = `M ${currentLeftX},${currentTopY + currentOsc} Q 150,${currentTopY + currentVortexDepth + waveOffset + currentOsc} ${currentRightX},${currentTopY + currentOsc}`;
+      const shouldUpdatePaths = needsLevelUpdate || needsOscillationUpdate || needsWaveUpdate || hasActiveDrop || hasActiveRipple;
 
-      if (liquidSurfaceRef.current) {
-        liquidSurfaceRef.current.setAttribute("d", surfaceD);
+      if (shouldUpdatePaths) {
+        // 5. Directly update the liquid mask and top surface paths
+        if (liquidMaskPathRef.current) {
+          const maskD = `
+            M ${currentLeftX} ${currentTopY + currentOsc}
+            Q 150 ${currentTopY + currentVortexDepth + waveOffset + currentOsc} ${currentRightX} ${currentTopY + currentOsc}
+            L 210 350
+            L 90 350
+            Z
+          `;
+          liquidMaskPathRef.current.setAttribute("d", maskD);
+        }
+
+        const surfaceD = `M ${currentLeftX},${currentTopY + currentOsc} Q 150,${currentTopY + currentVortexDepth + waveOffset + currentOsc} ${currentRightX},${currentTopY + currentOsc}`;
+
+        if (liquidSurfaceRef.current) {
+          liquidSurfaceRef.current.setAttribute("d", surfaceD);
+        }
       }
 
       // 6. Unified Droplet Queue Processor
@@ -621,6 +765,7 @@ export const LabEquipment: React.FC<LabEquipmentProps> = React.memo(({
 
   return (
     <div
+      ref={containerRef}
       onMouseMove={handleMouseMove}
       style={bgStyle}
       className="flex flex-col items-center justify-center p-8 bg-zinc-950/45 backdrop-blur-2xl border border-white/10 rounded-[24px] shadow-[inset_0_1px_1px_rgba(255,255,255,0.12)] glass-layered-shadow w-full min-h-[720px] relative transition-all duration-300"
@@ -882,7 +1027,7 @@ export const LabEquipment: React.FC<LabEquipmentProps> = React.memo(({
 
           {/* 5. BURETTE BODY - Perfectly Centered Horizontally at 150 */}
           {/* Outer borosilicate glass tube shadow and refraction */}
-          <rect x="143" y="15" width="14" height="210" rx="1" fill="rgba(10, 20, 30, 0.25)" stroke="url(#glass-edge-grad)" strokeWidth="1.2" filter="url(#glass-refraction)" />
+          <rect x="143" y="15" width="14" height="210" rx="1" fill="rgba(10, 20, 30, 0.25)" stroke="url(#glass-edge-grad)" strokeWidth="1.2" filter={quality === "low" ? undefined : "url(#glass-refraction)"} />
           {/* Glass tube internal refraction gradient */}
           <rect x="144" y="15" width="12" height="210" rx="0.5" fill="url(#glass-reflect)" stroke="rgba(255, 255, 255, 0.12)" strokeWidth="0.5" />
           
@@ -1040,7 +1185,7 @@ export const LabEquipment: React.FC<LabEquipmentProps> = React.memo(({
             fill="url(#glass-reflect)"
             stroke="url(#glass-edge-grad)"
             strokeWidth="1.6"
-            filter="url(#glass-refraction)"
+            filter={quality === "low" ? undefined : "url(#glass-refraction)"}
           />
 
           {/* Inner wall to show glass thickness */}
@@ -1212,16 +1357,17 @@ export const LabEquipment: React.FC<LabEquipmentProps> = React.memo(({
         )}
       </div>
 
-      {/* Manual speed controller overlay for magnetic stirrer */}
-      <div className="w-full max-w-xs mt-4 bg-zinc-950/60 backdrop-blur-xl border border-white/10 rounded-2xl shadow-[inset_0_1px_1px_rgba(255,255,255,0.1)] glass-layered-shadow p-3">
-        <div className="flex items-center justify-between text-xs font-semibold text-zinc-300">
-          <span className="flex items-center gap-1.5 font-mono uppercase tracking-wider text-[10px]">
-            <Activity className="w-3.5 h-3.5 text-indigo-400" />
-            {t.stirrer}
-          </span>
-          <span className="font-mono text-indigo-400">{stirrerSpeed}%</span>
-        </div>
-        <div className="flex items-center gap-2.5 mt-2">
+      {/* Unified Stirrer and Performance Engine controls dashboard */}
+      <div className="w-full max-w-xs mt-4 bg-zinc-950/60 backdrop-blur-xl border border-white/10 rounded-2xl shadow-[inset_0_1px_1px_rgba(255,255,255,0.1)] glass-layered-shadow p-3.5 flex flex-col gap-3">
+        {/* Stirrer speed knob dial */}
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center justify-between text-xs font-semibold text-zinc-300">
+            <span className="flex items-center gap-1.5 font-mono uppercase tracking-wider text-[10px]">
+              <Activity className="w-3.5 h-3.5 text-indigo-400" />
+              {t.stirrer}
+            </span>
+            <span className="font-mono text-indigo-400">{stirrerSpeed}%</span>
+          </div>
           <input
             type="range"
             min="0"
@@ -1230,6 +1376,56 @@ export const LabEquipment: React.FC<LabEquipmentProps> = React.memo(({
             onChange={(e) => onStirrerSpeedChange?.(parseInt(e.target.value, 10))}
             className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
           />
+        </div>
+
+        {/* Adaptive Perf Engine section */}
+        <div className="border-t border-white/5 pt-2.5 flex items-center justify-between gap-2 text-[10px] select-none font-semibold">
+          <div className="flex flex-col">
+            <span className="text-[9px] font-bold text-zinc-500 uppercase tracking-widest font-mono">
+              {isArabic ? "محرك الأداء" : "Perf Engine"}
+            </span>
+            <span className="text-[10px] font-extrabold text-cyan-400 font-mono mt-0.5 flex items-center gap-1">
+              {fps.toFixed(0)} <span className="text-[8px] font-normal text-zinc-500">FPS</span>
+            </span>
+          </div>
+
+          <div className="flex bg-zinc-950 border border-white/5 p-0.5 rounded-lg">
+            {(["low", "medium", "high", "ultra"] as const).map((q) => (
+              <button
+                key={q}
+                onClick={() => {
+                  setQuality(q);
+                  qualityRef.current = q;
+                  setIsAutoQuality(false);
+                  isAutoQualityRef.current = false;
+                }}
+                className={`px-1.5 py-1 text-[8px] font-black uppercase rounded-md transition-all cursor-pointer ${
+                  quality === q
+                    ? "bg-cyan-500 text-black font-extrabold"
+                    : "text-zinc-500 hover:text-zinc-300"
+                }`}
+              >
+                {q === "medium" ? "med" : q}
+              </button>
+            ))}
+          </div>
+
+          <button
+            onClick={() => {
+              setIsAutoQuality((prev) => {
+                const next = !prev;
+                isAutoQualityRef.current = next;
+                return next;
+              });
+            }}
+            className={`px-2 py-1 text-[8px] font-bold uppercase rounded-md border transition-all cursor-pointer ${
+              isAutoQuality
+                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400 font-extrabold"
+                : "bg-white/5 border-white/5 text-zinc-500 hover:text-zinc-400"
+            }`}
+          >
+            {isArabic ? "تلقائي" : "Auto"}
+          </button>
         </div>
       </div>
     </div>

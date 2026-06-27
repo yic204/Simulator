@@ -21,6 +21,7 @@ export const MathRenderer: React.FC<MathRendererProps> = ({
   const scrollRef = useRef<HTMLDivElement>(null);
   const eqRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState<number>(1);
+  const [isVisible, setIsVisible] = useState(false);
   
   // Keep font sizes fixed and readable as per user requirement: Do NOT reduce font size further.
   const fixedFontSize = block ? 25 : 18;
@@ -29,8 +30,37 @@ export const MathRenderer: React.FC<MathRendererProps> = ({
   // Normalize unicode minus character (and other hyphens) to standard ASCII minus for LaTeX compatibility
   formattedMath = formattedMath.replace(/−/g, "-");
 
+  // Lazy Intersection Observer to render only visible equations
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    if (typeof IntersectionObserver === "undefined") {
+      setIsVisible(true);
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            setIsVisible(true);
+            observer.disconnect();
+          }
+        });
+      },
+      { rootMargin: "150px" }
+    );
+
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [formattedMath]);
+
   // Render using our local katex instance (which is extended by mhchem)
   const renderedHtml = (() => {
+    if (!isVisible) {
+      return `<span class="text-zinc-600/50 italic text-xs animate-pulse">...</span>`;
+    }
     try {
       return katex.renderToString(formattedMath, {
         displayMode: block,
@@ -44,7 +74,7 @@ export const MathRenderer: React.FC<MathRendererProps> = ({
   })();
 
   const adjustLayout = () => {
-    if (!block) return;
+    if (!block || !isVisible) return;
     if (!containerRef.current || !scrollRef.current || !eqRef.current) return;
 
     const scrollElement = scrollRef.current;
@@ -79,7 +109,7 @@ export const MathRenderer: React.FC<MathRendererProps> = ({
 
   // Adjust layout after mount/update and parent element resizes
   useEffect(() => {
-    if (!block) return;
+    if (!block || !isVisible) return;
 
     adjustLayout();
 
